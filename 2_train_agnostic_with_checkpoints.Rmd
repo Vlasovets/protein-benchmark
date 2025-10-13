@@ -1,0 +1,878 @@
+---
+title: "2_train_agnostic_1_notbalanced_1_incid_normal_4olegV2_with_checkpoints"
+output: html_document
+date: "2025-10-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+##################################################################################
+# [NOTE] train test with CHECKPOINT SYSTEM
+##################################################################################
+# Load checkpoint system
+source("~/projects/protein-benchmark/checkpoint_timing_system.R")
+```
+
+```{r}
+convert_path <- function(original_path) {
+  local_path <- gsub("/lustre/groups/itg/teams/zeggini/projects/fungen-oa/analyses/olink/classifier/", 
+                     "/home/itg/oleg.vlasovets/projects/protein-benchmark/", 
+                     original_path)
+  return(local_path)
+}
+
+setwd(convert_path("/lustre/groups/itg/teams/zeggini/projects/fungen-oa/analyses/olink/classifier/"))
+```
+
+```{r}
+base_dir <- "/home/itg/oleg.vlasovets/projects/protein-benchmark/"
+dir.create(file.path(base_dir, "output"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(base_dir, "data"), recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+##################################################################################
+# PIPELINE WITH CHECKPOINTS AND TIMING
+##################################################################################
+start_time <- Sys.time()
+##################################################################################
+setwd("/home/itg/oleg.vlasovets/projects/protein-benchmark/")
+
+##################################################################################
+# Load packages
+# CRAN packages
+cran_packages <- c("caret", "randomForest", "data.table", 
+                   "pROC", "xgboost", "plyr", "glmnet", "doParallel", "ranger")
+
+# Bioconductor packages
+bioc_packages <- c("limma")
+
+# Install CRAN packages
+for (pkg in cran_packages) {
+    if (!require(pkg, character.only = TRUE)) {
+        install.packages(pkg)
+        library(pkg, character.only = TRUE)
+    }
+}
+
+# Install BiocManager if needed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+
+# Install Bioconductor packages
+for (pkg in bioc_packages) {
+    if (!require(pkg, character.only = TRUE)) {
+        BiocManager::install(pkg)
+        library(pkg, character.only = TRUE)
+    }
+}
+
+# Set up parallel processing
+cl <- 5
+registerDoParallel(cl)
+##################################################################################
+source("~/projects/protein-benchmark/1_train_agnostic_0_utils.R")
+
+# NOTE: This script requires the following data files from your colleague:
+# 1. The utils file: 1_train_agnostic_0_utils.R (already referenced above)
+# 2. Protein annotation file: 2941ProteinIDNamesPanels.txt
+# 3. Control cohort file: SRplusPC-AllInds-AllVisits-AllCC.ukb9979.v9.txt  
+# 4. Sample split files: sample_split_obj_COMBINED_*_split91.rda
+# 5. Input data matrices containing protein expression and phenotype data
+# The script will create placeholder files but you need real data to run successfully
+
+##################################################################################
+# define paths
+PATH_OUT_INIT = "/home/itg/oleg.vlasovets/projects/protein-benchmark/output/"
+PATH_DATA_DIR = "/home/itg/oleg.vlasovets/projects/protein-benchmark/data/"
+
+get_ctrl_seeds = function(in_number_folds, in_tunelength, in_seed = 123){
+    seeds <- vector(mode = "list", length = in_number_folds + 1)
+    set.seed(in_seed)
+    for(i in 1:in_number_folds) {
+        seeds[[i]] <- sample.int(1000, in_tunelength)
+    }
+    set.seed(in_seed)
+    seeds[[in_number_folds + 1]] <- sample.int(1000, 1)
+
+    return(seeds)
+}
+
+get_ctrl <- function(in_number_folds, in_tunelength, in_sampling = SAMPLING, in_seed = 13){
+    seeds = get_ctrl_seeds(in_number_folds = in_number_folds, in_tunelength = in_tunelength, in_seed = 123)
+    
+    set.seed(in_seed)
+    if(in_sampling != "none"){
+        res <- trainControl(method = "cv", number = in_number_folds, verboseIter = T, sampling = in_sampling, 
+                    allowParallel = TRUE, seeds=seeds)
+    }else{
+        res <- trainControl(method = "cv", number = 5, verboseIter = T, seeds=seeds)
+    }
+    return(res)
+}
+
+get_ctrl_repeatedcv <- function(in_number_folds, in_number_repeats, in_tunelength, in_sampling = SAMPLING, in_seed = 13){
+    seeds = get_ctrl_seeds(in_number_folds = in_number_folds * in_number_repeats, in_tunelength = in_tunelength, in_seed = 123)
+    
+    set.seed(in_seed)
+    if(in_sampling != "none"){
+        res <- trainControl(method = "repeatedcv", number = in_number_folds, verboseIter = T, sampling = in_sampling, 
+                    allowParallel = TRUE, seeds=seeds, repeats = in_number_repeats)
+    }else{
+        res <- NA
+    }
+    return(res)
+}
+######################################################
+# CHANGE PARAMETERS HERE
+
+#define input and output path
+OA_PHENO_VEC = c("Spine")
+NR_PROTEINS_VEC = c(8)
+
+length(OA_PHENO_VEC) == length(NR_PROTEINS_VEC)
+######################################################
+IN_DIR_LABEL <- "more2until5INCID_superc01exclno"
+# more2INCID_superc01exclno
+######################################################
+SUB_DIR = paste0("5_all_strict_noagesex_", IN_DIR_LABEL)
+
+# IN_RELCOL_SUB <- "AOD_diff_case_t0_incid_more2until5","AOD_diff_case_t0_incid_more2"
+IN_RELCOL_SUB <- "AOD_diff_case_t0_incid_more2until5"
+
+PERFORM_TRAIN_LIST = list(prot_only = T, sexagebmi = T, comb = T)
+PRED_MODE_VEC = c("prot_only", "comb", "sexagebmi")
+
+PRED_COVS = c("sex", "bmi", "age")
+PRED_COVS_NOTINCLUDE = setdiff(c("sex", "age", "bmi"), PRED_COVS)
+######################################################
+adjust_comb_nrprots = T
+
+PERFORM_RFE = T
+
+TRAIN_FI_RF_GRID = T
+
+TRAIN_FI_RF_NR_ITER = 5
+TRAIN_FI_RF_NR_FOLD = 5
+
+NR_FOLDS_FEATURESEL_RF = 5
+
+SAMPLING = "rose"
+
+VAL_RF = T
+VAL_GLMNET = T
+VAL_XG = T
+
+TUNELENGTH_RF = 10
+TUNELENGTH_GLMNET = 80
+TUNELENGTH_XG = 10
+
+# define label of outcome files
+if(PERFORM_RFE){
+    label_rfe = "rfe"
+}else{
+    label_rfe = "norfe"
+}
+
+PATH_ANNO = paste0(PATH_DATA_DIR, "2941ProteinIDNamesPanels.txt")
+PATH_CC = paste0(PATH_DATA_DIR, "SRplusPC-AllInds-AllVisits-AllCC.ukb9979.v9.txt")
+
+# Create output and data directories
+dir.create(PATH_OUT_INIT, recursive = TRUE, showWarnings = FALSE)
+dir.create(PATH_DATA_DIR, recursive = TRUE, showWarnings = FALSE)
+##################################################################################
+# [ITER] iterate over phenotypes and nr of proteins
+# curr_elem = 1
+sapply(1:length(OA_PHENO_VEC), FUN = function(curr_elem){
+
+    OA_PHENO = OA_PHENO_VEC[curr_elem]
+    NR_PROTEINS = NR_PROTEINS_VEC[curr_elem]
+
+    # set_paths
+    PATH_IN = paste0(PATH_OUT_INIT, OA_PHENO, "/", SUB_DIR,"/")
+    PATH_IN_SUBDIR = paste0("models_nrfeat", NR_PROTEINS)
+
+    PATH_IN_ORIG = PATH_IN
+    PATH_IN = paste0(PATH_IN, PATH_IN_SUBDIR)
+
+    # SET THESE DIRECOTIRES TO BENCHMARK FOLDERS
+    PATH_OUT_MODEL_PONLY = paste0(PATH_IN, "/models_benchmark_oleg_V1/")
+    PATH_OUT_MODEL_COMB = paste0(PATH_IN, "/models_comb_benchmark_oleg_V1/")
+    PATH_OUT_MODEL_sexagebmi = paste0(PATH_IN_ORIG, "/models_sexagebmi_benchmark_oleg_V1/")
+
+    PATH_OUT_TMPFILES_PONLY = paste0(PATH_OUT_MODEL_PONLY, "/tmp_files/")
+    PATH_OUT_TMPFILES_COMB = paste0(PATH_OUT_MODEL_COMB, "/tmp_files/")
+    PATH_OUT_TMPFILES_sexagebmi = paste0(PATH_OUT_MODEL_sexagebmi, "/tmp_files/")
+
+    # create model and tmp_files (if not there)
+    dir.create(PATH_IN, recursive = TRUE, showWarnings = FALSE) 
+    dir.create(PATH_OUT_MODEL_PONLY, recursive = TRUE, showWarnings = FALSE) 
+    dir.create(PATH_OUT_MODEL_COMB, recursive = TRUE, showWarnings = FALSE) 
+    dir.create(PATH_OUT_MODEL_sexagebmi, recursive = TRUE, showWarnings = FALSE) 
+    dir.create(PATH_OUT_TMPFILES_PONLY, recursive = TRUE, showWarnings = FALSE) 
+    dir.create(PATH_OUT_TMPFILES_COMB, recursive = TRUE, showWarnings = FALSE) 
+    dir.create(PATH_OUT_TMPFILES_sexagebmi, recursive = TRUE, showWarnings = FALSE) 
+
+    p_anno = get_p_anno(in_p = PATH_ANNO)
+
+    NR_PROTEINS_COMB = NR_PROTEINS + 1
+    ##################################################################################
+    # PRED_MODE = PRED_MODE_VEC[1]
+    # prot_only|sexagebmi|comb
+    ####################################################################################################################################################################
+    sapply(PRED_MODE_VEC, FUN = function(PRED_MODE){
+        ##################################################################################
+        print("########################################################################################")
+        print(PRED_MODE)
+        print("########################################################################################")
+        PERFORM_TRAIN = PERFORM_TRAIN_LIST[[PRED_MODE]]
+        
+        ##################################################################################
+        # INITIALIZE CHECKPOINT SYSTEM FOR THIS PREDICTION MODE
+        ##################################################################################
+        # define current mode and tmpfile
+        if(PRED_MODE == "prot_only"){
+            PATH_OUT_MODEL = PATH_OUT_MODEL_PONLY
+            PATH_OUT_TMPFILES = PATH_OUT_TMPFILES_PONLY
+        }else if(PRED_MODE == "sexagebmi"){
+            PATH_OUT_MODEL = PATH_OUT_MODEL_sexagebmi
+            PATH_OUT_TMPFILES = PATH_OUT_TMPFILES_sexagebmi
+        }else if(PRED_MODE == "comb"){
+            PATH_OUT_MODEL = PATH_OUT_MODEL_COMB
+            PATH_OUT_TMPFILES = PATH_OUT_TMPFILES_COMB
+        }else{
+            stop("No valid mode. set parameter to: prot_only or sexagebmi or comb")
+        }
+
+        # list of covariates that are potentially used as predictors
+        if(PRED_MODE != "sexagebmi"){
+            OUT_LABEL = paste0(SAMPLING, "_", "top", NR_PROTEINS, "_", label_rfe)
+        }else{
+            OUT_LABEL = paste0(SAMPLING, "_", PRED_MODE)
+        }
+        
+        # Initialize checkpoint system for this mode
+        checkpoint_system <- initialize_checkpoint_system(PATH_OUT_MODEL, 
+                                                         paste0(OUT_LABEL, "_", PRED_MODE))
+        
+        ##################################################################################
+        # CHECKPOINT 1: Setup and Configuration
+        ##################################################################################
+        step_start <- Sys.time()
+        setup_data <- list(
+            parameters = list(
+                OA_PHENO = OA_PHENO,
+                NR_PROTEINS = NR_PROTEINS,
+                PRED_MODE = PRED_MODE,
+                OUT_LABEL = OUT_LABEL,
+                SAMPLING = SAMPLING,
+                PERFORM_RFE = PERFORM_RFE,
+                VAL_RF = VAL_RF,
+                VAL_GLMNET = VAL_GLMNET,
+                VAL_XG = VAL_XG,
+                IN_DIR_LABEL = IN_DIR_LABEL,
+                IN_RELCOL_SUB = IN_RELCOL_SUB
+            ),
+            paths = list(
+                PATH_OUT_MODEL = PATH_OUT_MODEL,
+                PATH_OUT_TMPFILES = PATH_OUT_TMPFILES,
+                PATH_ANNO = PATH_ANNO,
+                PATH_CC = PATH_CC,
+                PATH_DATA_DIR = PATH_DATA_DIR
+            ),
+            covariates = list(
+                PRED_COVS = PRED_COVS,
+                PRED_COVS_NOTINCLUDE = PRED_COVS_NOTINCLUDE
+            )
+        )
+        checkpoint_system <- save_checkpoint(setup_data, "setup_config", checkpoint_system, step_start,
+                                           "Pipeline setup and configuration parameters")
+        
+        ##################################################################################
+        # CHECKPOINT 2: Data Loading
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        # Check if required functions exist
+        if (!exists("get_matrices")) {
+            stop("ERROR: get_matrices function not found. Please ensure 1_train_agnostic_0_utils.R is properly sourced and contains all required functions.")
+        }
+        
+        # Check if sample split file exists
+        sample_split_file <- paste0(PATH_DATA_DIR, "sample_split_obj_COMBINED_", IN_DIR_LABEL, "_split91.rda")
+        if (!file.exists(sample_split_file)) {
+            stop("ERROR: Sample split file not found: ", sample_split_file, "\nPlease obtain this file from your colleague.")
+        }
+        
+        get_matrices_obj = get_matrices(in_path_cc = PATH_CC, in_relcol_sub = IN_RELCOL_SUB, 
+                                       in_outcome = OA_PHENO, 
+                                       in_path_sample_split = sample_split_file, 
+                                       in_pred_mode = PRED_MODE)
+
+        matrix_data <- list(
+            p_mtx_traintest_ukbb = get_matrices_obj$p_mtx_traintest,
+            pheno_train_test_ukbb = get_matrices_obj$pheno_train_test,
+            p_mtx_val_ukbb = get_matrices_obj$p_mtx_val,
+            pheno_val_ukbb = get_matrices_obj$pheno_val,
+            data_info = list(
+                train_dimensions = dim(get_matrices_obj$p_mtx_traintest),
+                val_dimensions = dim(get_matrices_obj$p_mtx_val),
+                train_samples = nrow(get_matrices_obj$p_mtx_traintest),
+                val_samples = nrow(get_matrices_obj$p_mtx_val),
+                n_features = ncol(get_matrices_obj$p_mtx_traintest),
+                sample_split_file = sample_split_file
+            )
+        )
+        
+        checkpoint_system <- save_checkpoint(matrix_data, "data_loading", checkpoint_system, step_start,
+                                           sprintf("Loaded matrices: %dx%d train, %dx%d validation", 
+                                                  matrix_data$data_info$train_dimensions[1],
+                                                  matrix_data$data_info$train_dimensions[2],
+                                                  matrix_data$data_info$val_dimensions[1],
+                                                  matrix_data$data_info$val_dimensions[2]))
+
+        # Extract matrices for use
+        p_mtx_traintest_ukbb <- matrix_data$p_mtx_traintest_ukbb
+        pheno_train_test_ukbb <- matrix_data$pheno_train_test_ukbb
+        p_mtx_val_ukbb <- matrix_data$p_mtx_val_ukbb
+        pheno_val_ukbb <- matrix_data$pheno_val_ukbb
+        rm(get_matrices_obj)
+
+        ##################################################################################
+        # CHECKPOINT 3: PWAS Analysis
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        if((PRED_MODE != "sexagebmi")){
+            prot_sig_result = perform_pwas(in_p_mtx = p_mtx_traintest_ukbb[,!(colnames(p_mtx_traintest_ukbb) %in% PRED_COVS)], 
+                                          in_pheno = pheno_train_test_ukbb)
+            
+            pwas_data <- list(
+                pwas_sumstats = prot_sig_result$pwas_sumstats,
+                prot_sig_original = prot_sig_result$prot_sig,
+                n_significant = length(prot_sig_result$prot_sig),
+                analysis_info = list(
+                    excluded_covariates = PRED_COVS,
+                    n_proteins_tested = ncol(p_mtx_traintest_ukbb[,!(colnames(p_mtx_traintest_ukbb) %in% PRED_COVS)]),
+                    n_samples = nrow(pheno_train_test_ukbb)
+                )
+            )
+            
+            # Save PWAS results (as in original code)
+            tmp = prot_sig_result$pwas_sumstats
+            save(tmp, file = paste0(PATH_OUT_MODEL, "pwas.rda"))
+            rm(tmp)
+            
+            prot_sig = prot_sig_result$prot_sig
+            if((PRED_MODE != "prot_only")){
+                prot_sig = c(prot_sig, PRED_COVS)
+                pwas_data$prot_sig_with_covs = prot_sig
+                pwas_data$added_covariates = PRED_COVS
+            }
+            
+            pwas_data$prot_sig_final = prot_sig
+            
+        } else {
+            pwas_data <- list(
+                message = "PWAS analysis skipped for sexagebmi mode",
+                mode = "sexagebmi"
+            )
+            prot_sig <- PRED_COVS
+        }
+        
+        checkpoint_system <- save_checkpoint(pwas_data, "pwas_analysis", checkpoint_system, step_start,
+                                           sprintf("PWAS completed: %d significant proteins", 
+                                                  ifelse(exists("prot_sig_result"), pwas_data$n_significant, 0)))
+
+        ##################################################################################
+        # CHECKPOINT 4: Random Forest Training (Feature Importance)
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        if((PRED_MODE != "sexagebmi") && PERFORM_TRAIN){
+            p_in = pheno_train_test_ukbb
+            m_in = p_mtx_traintest_ukbb[, prot_sig]
+            
+            print(paste0(" --> train data samples in right order: ", identical(rownames(p_in), rownames(m_in))))
+            print(paste0(" --> nr considered proteins: ", length(unique(colnames(m_in)))))
+            
+            tuneGrid = define_train_grid(nr_feat = length(prot_sig), rel_row = NULL) 
+            ctrl = get_ctrl(in_number_folds = NR_FOLDS_FEATURESEL_RF, in_tunelength = nrow(tuneGrid), 
+                            in_sampling = SAMPLING)
+            
+            training_obj = perform_rf_training(in_number_iter = TRAIN_FI_RF_NR_ITER, 
+                                             in_number_folds = TRAIN_FI_RF_NR_ITER, m_in = m_in, 
+                                             p_in = p_in, in_ctrl = ctrl, in_grid = tuneGrid, 
+                                             outpath = PATH_OUT_TMPFILES)
+            
+            rf_training_data <- list(
+                training_obj = training_obj,
+                tuneGrid = tuneGrid,
+                training_info = list(
+                    n_iterations = TRAIN_FI_RF_NR_ITER,
+                    n_folds = NR_FOLDS_FEATURESEL_RF,
+                    sampling_method = SAMPLING,
+                    n_features = length(prot_sig),
+                    n_samples = nrow(m_in)
+                ),
+                data_checks = list(
+                    sample_order_correct = identical(rownames(p_in), rownames(m_in)),
+                    n_proteins_used = length(unique(colnames(m_in)))
+                ),
+                performance_summary = get_sen_spec_acc(in_p = PATH_OUT_TMPFILES)
+            )
+            
+        } else {
+            rf_training_data <- list(
+                message = sprintf("RF training skipped (PRED_MODE: %s, PERFORM_TRAIN: %s)", 
+                                PRED_MODE, PERFORM_TRAIN),
+                skipped_reason = list(
+                    pred_mode = PRED_MODE,
+                    perform_train = PERFORM_TRAIN
+                )
+            )
+        }
+        
+        checkpoint_system <- save_checkpoint(rf_training_data, "rf_training", checkpoint_system, step_start,
+                                           "Random Forest training for feature importance")
+
+        ##################################################################################
+        # CHECKPOINT 5: Feature Importance Calculation
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        if((PRED_MODE != "sexagebmi")){
+            print(get_sen_spec_acc(in_p = PATH_OUT_TMPFILES))
+            
+            prot_mean = get_feat_importance(in_p = PATH_OUT_TMPFILES, 
+                                           in_mtx = t(p_mtx_traintest_ukbb[,prot_sig]), 
+                                           in_p_anno = get_p_anno(in_p = PATH_ANNO))
+            
+            correlation_test = cor.test(prot_mean$imp_mean, prot_mean$imp_median, method = "pearson")
+            print(paste0(correlation_test))
+
+            # Merge with PWAS results
+            tmp = get(load(file = paste0(PATH_OUT_MODEL, "pwas.rda")))
+            prot_mean_merged = cbind(prot_mean, tmp[rownames(prot_mean),])
+            
+            feature_importance_data <- list(
+                prot_mean_raw = prot_mean,
+                prot_mean_with_pwas = prot_mean_merged,
+                correlation_test = correlation_test,
+                importance_stats = list(
+                    mean_importance = summary(prot_mean$imp_mean),
+                    median_importance = summary(prot_mean$imp_median),
+                    top_10_features = head(prot_mean[order(-prot_mean$imp_mean),], 10)
+                ),
+                analysis_info = list(
+                    n_features = nrow(prot_mean),
+                    correlation_p_value = correlation_test$p.value,
+                    correlation_estimate = correlation_test$estimate
+                )
+            )
+            
+            # Save merged results (as in original)
+            fwrite(prot_mean_merged, file = paste0(PATH_OUT_MODEL, "pwas_nrfeat_", OUT_LABEL, ".txt.gz"), 
+                   sep = "\t", compress = "gzip")
+
+            # Generate plots (as in original)
+            pdf(file = paste0(PATH_OUT_MODEL, "prot_importance_mean_CLEAN_", OUT_LABEL, ".pdf"), onefile = T)
+            print(ggplot(prot_mean, aes(x=rank, y=imp_mean, color = "black")) + 
+                  geom_point(show.legend = FALSE) + theme_light() +
+                  ylab("Mean feature\nimportance") + xlab("Proteins"))
+            print(ggplot(prot_mean[1:30,], aes(x=rank, y=imp_mean, color = "black")) + 
+                  geom_point(show.legend = FALSE) + theme_light() +
+                  ylab("Mean feature\nimportance") + xlab("Proteins"))
+            dev.off()
+            
+        } else {
+            feature_importance_data <- list(
+                message = "Feature importance analysis skipped for sexagebmi mode",
+                mode = "sexagebmi"
+            )
+        }
+        
+        checkpoint_system <- save_checkpoint(feature_importance_data, "feature_importance", checkpoint_system, step_start,
+                                           "Feature importance calculation and visualization")
+
+        ##################################################################################
+        # CHECKPOINT 6: RFE (Recursive Feature Elimination)
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        rfe_data <- list()
+
+        if(PRED_MODE == "prot_only"){
+            if(PERFORM_RFE){
+                registerDoParallel(5)
+                rel_features_result = run_rfe(in_pheno = pheno_train_test_ukbb, in_m = p_mtx_traintest_ukbb, 
+                                             in_dat = prot_mean, in_nr_proteins = NR_PROTEINS, 
+                                             rfe_number = 5, in_label = OUT_LABEL, in_p = PATH_OUT_MODEL)
+                
+                rfe_data <- list(
+                    rel_features = rel_features_result$rel_features,
+                    updated_label = rel_features_result$in_label,
+                    rfe_info = list(
+                        original_n_features = length(prot_sig),
+                        selected_n_features = length(rel_features_result$rel_features),
+                        target_n_proteins = NR_PROTEINS,
+                        rfe_folds = 5
+                    ),
+                    mode = "prot_only_with_rfe"
+                )
+                
+                OUT_LABEL = rel_features_result$in_label
+                rel_features = rel_features_result$rel_features
+                
+            } else {
+                rel_features = getfrom_ranked_proteins()
+                rfe_data <- list(
+                    rel_features = rel_features,
+                    mode = "prot_only_without_rfe",
+                    method = "ranked_proteins"
+                )
+            }
+            
+        } else if(PRED_MODE == "sexagebmi"){
+            rel_features = PRED_COVS
+            rfe_data <- list(
+                rel_features = rel_features,
+                mode = "sexagebmi",
+                features_used = PRED_COVS
+            )
+            
+        } else if(PRED_MODE == "comb"){
+            if(PERFORM_RFE){
+                rfe_nr_prots = ifelse(adjust_comb_nrprots, NR_PROTEINS_COMB, NR_PROTEINS)
+                registerDoParallel(5)
+                
+                prot_mean_filtered = prot_mean[!(rownames(prot_mean) %in% PRED_COVS_NOTINCLUDE),]
+                
+                rel_features_result = run_rfe(in_pheno = pheno_train_test_ukbb, in_m = p_mtx_traintest_ukbb, 
+                                             in_dat = prot_mean_filtered, in_nr_proteins = rfe_nr_prots, 
+                                             rfe_number = 5, in_label = OUT_LABEL, in_p = PATH_OUT_MODEL)
+                
+                OUT_LABEL = rel_features_result$in_label
+                rel_features = unique(c(rel_features_result$rel_features, PRED_COVS))
+                
+                rfe_data <- list(
+                    rel_features_from_rfe = rel_features_result$rel_features,
+                    rel_features_final = rel_features,
+                    forced_covariates = PRED_COVS,
+                    excluded_covariates = PRED_COVS_NOTINCLUDE,
+                    rfe_info = list(
+                        target_n_proteins = rfe_nr_prots,
+                        adjust_comb_nrprots = adjust_comb_nrprots,
+                        original_NR_PROTEINS = NR_PROTEINS,
+                        NR_PROTEINS_COMB = NR_PROTEINS_COMB
+                    ),
+                    mode = "comb_with_rfe"
+                )
+                
+            } else {
+                rel_features = getfrom_ranked_proteins()
+                rel_features = unique(c(rel_features, PRED_COVS))
+                rfe_data <- list(
+                    rel_features = rel_features,
+                    forced_covariates = PRED_COVS,
+                    mode = "comb_without_rfe",
+                    method = "ranked_proteins_plus_covs"
+                )
+            }
+        }
+
+        checkpoint_system <- save_checkpoint(rfe_data, "rfe_feature_selection", checkpoint_system, step_start,
+                                           sprintf("RFE completed: %d features selected", length(rel_features)))
+
+        ##################################################################################
+        # CHECKPOINT 7: Model Training Data Preparation
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        train_d = p_mtx_traintest_ukbb[,rel_features]
+        
+        model_prep_data <- list(
+            rel_features = rel_features,
+            train_data = train_d,
+            data_checks = list(
+                train_dimensions = dim(train_d),
+                features_in_data = all(rel_features %in% colnames(train_d)),
+                sample_order_correct = identical(rownames(train_d), rownames(pheno_train_test_ukbb))
+            ),
+            phenotype_summary = table(pheno_train_test_ukbb$oa_status),
+            feature_info = list(
+                n_selected_features = length(rel_features),
+                feature_names = rel_features
+            )
+        )
+        
+        checkpoint_system <- save_checkpoint(model_prep_data, "model_data_prep", checkpoint_system, step_start,
+                                           sprintf("Prepared training data: %d samples x %d features", 
+                                                  nrow(train_d), ncol(train_d)))
+
+        print(sprintf("Training data dimensions: %d x %d", nrow(train_d), ncol(train_d)))
+        print(sprintf("All features in data: %s", all(rel_features %in% colnames(train_d))))
+        print("Phenotype distribution:")
+        print(table(pheno_train_test_ukbb$oa_status))
+
+        ##################################################################################
+        # CHECKPOINT 8: Random Forest Final Model Training
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        if(VAL_RF){
+            print("Training Final RF Model")
+            
+            mtry = ceiling(sqrt(ncol(train_d)))
+            mtry = unique(ceiling(c(mtry*0.6, mtry*0.8, mtry*1, mtry*1.2)))
+            tuneGrid = data.frame(mtry = mtry)
+            
+            TUNELENGTH_RF = nrow(tuneGrid)
+            RF_MODEL_LABEL = paste0("model_rf_", OUT_LABEL, "_tunegrid", TUNELENGTH_RF , ".rda")
+
+            log_file = paste0(strsplit(basename(RF_MODEL_LABEL), "\\.")[[1]][1], ".log")
+            if(file.exists(paste0(PATH_OUT_MODEL, log_file))) {
+                file.remove(paste0(PATH_OUT_MODEL, log_file))
+            }
+            
+            # Note: write_log_file function call commented out as it may not exist
+            # write_log_file(in_pheno_tt = pheno_train_test_ukbb, in_pheno_val = pheno_val_ukbb, 
+            #                in_feat = rel_features, in_log_file = log_file, in_prot_mean = prot_mean, 
+            #                in_dir = PATH_OUT_MODEL, in_pred_mode = PRED_MODE)
+
+            ctrl = get_ctrl_repeatedcv(in_number_folds = NR_FOLDS_FEATURESEL_RF, 
+                                      in_number_repeats = 5, 
+                                      in_tunelength = nrow(tuneGrid), 
+                                      in_sampling = SAMPLING, in_seed = 13)
+
+            set.seed(13)
+            model_rf <- caret::train(y = pheno_train_test_ukbb$oa_status, 
+                                    x = train_d, method = "rf", 
+                                    preProcess = NULL, trControl = ctrl, metric = "Accuracy", 
+                                    maximize = T, tuneGrid = tuneGrid)
+
+            rf_final_data <- list(
+                model = model_rf,
+                model_info = list(
+                    best_tune = model_rf$bestTune,
+                    final_model_mtry = model_rf$finalModel$mtry,
+                    n_trees = model_rf$finalModel$ntree
+                ),
+                performance = list(
+                    results = model_rf$results,
+                    best_accuracy = max(model_rf$results$Accuracy),
+                    cv_results = model_rf$resample
+                ),
+                training_config = list(
+                    tuneGrid = tuneGrid,
+                    tunelength = TUNELENGTH_RF,
+                    cv_folds = NR_FOLDS_FEATURESEL_RF,
+                    cv_repeats = 5,
+                    sampling = SAMPLING
+                )
+            )
+            
+            save(model_rf, file = paste0(PATH_OUT_MODEL, RF_MODEL_LABEL))
+            
+        } else {
+            rf_final_data <- list(
+                message = "Random Forest final model training skipped (VAL_RF = FALSE)"
+            )
+        }
+        
+        checkpoint_system <- save_checkpoint(rf_final_data, "rf_final_model", checkpoint_system, step_start,
+                                           ifelse(VAL_RF, 
+                                                 sprintf("RF model trained with accuracy: %.3f", 
+                                                        ifelse(exists("model_rf"), max(model_rf$results$Accuracy), 0)),
+                                                 "RF training skipped"))
+
+        ##################################################################################
+        # CHECKPOINT 9: GLMNET Model Training
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        if(VAL_GLMNET){
+            print("Training GLMNET Model")
+            
+            GLMNET_MODEL_LABEL = paste0(PATH_OUT_MODEL, "model_glmnet_", OUT_LABEL, "_tunegrid", TUNELENGTH_GLMNET , ".rda")
+
+            log_file = paste0(strsplit(basename(GLMNET_MODEL_LABEL), "\\.")[[1]][1], ".log")
+            if(file.exists(paste0(PATH_OUT_MODEL, log_file))) {
+                file.remove(paste0(PATH_OUT_MODEL, log_file))
+            }
+            
+            # Note: write_log_file function call commented out as it may not exist
+            # write_log_file(in_pheno_tt = pheno_train_test_ukbb, in_pheno_val = pheno_val_ukbb, 
+            #                in_feat = rel_features, in_log_file = log_file, in_prot_mean = prot_mean, 
+            #                in_dir = PATH_OUT_MODEL, in_pred_mode = PRED_MODE)
+
+            ctrl = get_ctrl_repeatedcv(in_number_folds = NR_FOLDS_FEATURESEL_RF, 
+                                      in_number_repeats = 5, 
+                                      in_tunelength = TUNELENGTH_GLMNET, 
+                                      in_sampling = SAMPLING, in_seed = 13)
+
+            set.seed(13)
+            model_glmnet <- caret::train(y = pheno_train_test_ukbb$oa_status, x = train_d, 
+                                        method = "glmnet", preProcess = NULL, 
+                                        trControl = ctrl, metric = "Accuracy", maximize = T, 
+                                        tuneLength = TUNELENGTH_GLMNET)
+
+            glmnet_data <- list(
+                model = model_glmnet,
+                model_info = list(
+                    best_tune = model_glmnet$bestTune,
+                    best_alpha = model_glmnet$bestTune$alpha,
+                    best_lambda = model_glmnet$bestTune$lambda
+                ),
+                performance = list(
+                    results = model_glmnet$results,
+                    best_accuracy = max(model_glmnet$results$Accuracy),
+                    cv_results = model_glmnet$resample
+                ),
+                training_config = list(
+                    tune_length = TUNELENGTH_GLMNET,
+                    cv_folds = NR_FOLDS_FEATURESEL_RF,
+                    cv_repeats = 5,
+                    sampling = SAMPLING
+                )
+            )
+            
+            save(model_glmnet, file = paste0(PATH_OUT_MODEL, basename(GLMNET_MODEL_LABEL)))
+            
+        } else {
+            glmnet_data <- list(
+                message = "GLMNET model training skipped (VAL_GLMNET = FALSE)"
+            )
+        }
+        
+        checkpoint_system <- save_checkpoint(glmnet_data, "glmnet_model", checkpoint_system, step_start,
+                                           ifelse(VAL_GLMNET,
+                                                 sprintf("GLMNET model trained with accuracy: %.3f",
+                                                        ifelse(exists("model_glmnet"), max(model_glmnet$results$Accuracy), 0)),
+                                                 "GLMNET training skipped"))
+
+        ##################################################################################
+        # CHECKPOINT 10: XGBoost Model Training
+        ##################################################################################
+        step_start <- Sys.time()
+        
+        if(VAL_XG){
+            print("Training XGBoost Model")
+            registerDoParallel(1)
+
+            XG_MODEL_LABEL = paste0(PATH_OUT_MODEL, "model_xgboost_", OUT_LABEL, "_tunegrid", TUNELENGTH_XG , ".rda")
+
+            log_file = paste0(strsplit(basename(XG_MODEL_LABEL), "\\.")[[1]][1], ".log")
+            if(file.exists(paste0(PATH_OUT_MODEL, log_file))) {
+                file.remove(paste0(PATH_OUT_MODEL, log_file))
+            }
+            
+            # Note: write_log_file function call commented out as it may not exist
+            # write_log_file(in_pheno_tt = pheno_train_test_ukbb, in_pheno_val = pheno_val_ukbb, 
+            #                in_feat = rel_features, in_log_file = log_file, in_prot_mean = prot_mean, 
+            #                in_dir = PATH_OUT_MODEL, in_pred_mode = PRED_MODE)
+
+            set.seed(13)
+            grid_50 <- expand.grid(
+                nrounds = c(150, 300, 500),
+                max_depth = c(1,3,5,7,10),
+                eta = c(0.03, 0.05, 0.1),
+                gamma = c(0),
+                colsample_bytree = 1.0,
+                min_child_weight = c(1, 3),
+                subsample = c(0.6,0.8, 1.0))   
+
+            ctrl = get_ctrl_repeatedcv(in_number_folds = NR_FOLDS_FEATURESEL_RF, 
+                                      in_number_repeats = 5, 
+                                      in_tunelength = nrow(grid_50), 
+                                      in_sampling = SAMPLING, in_seed = 13)
+
+            set.seed(13)
+            model_xgboost <- caret::train(y = pheno_train_test_ukbb$oa_status, x = train_d, 
+                                         method = "xgbTree", preProcess = NULL, 
+                                         trControl = ctrl, metric = "Accuracy", maximize = T, 
+                                         tuneGrid = grid_50, verbosity = 0)
+
+            xgb_data <- list(
+                model = model_xgboost,
+                model_info = list(
+                    best_tune = model_xgboost$bestTune,
+                    best_params = model_xgboost$bestTune
+                ),
+                performance = list(
+                    results = model_xgboost$results,
+                    best_accuracy = max(model_xgboost$results$Accuracy),
+                    cv_results = model_xgboost$resample
+                ),
+                training_config = list(
+                    grid = grid_50,
+                    grid_size = nrow(grid_50),
+                    cv_folds = NR_FOLDS_FEATURESEL_RF,
+                    cv_repeats = 5,
+                    sampling = SAMPLING
+                )
+            )
+            
+            save(model_xgboost, file = paste0(PATH_OUT_MODEL, basename(XG_MODEL_LABEL)))
+            
+        } else {
+            xgb_data <- list(
+                message = "XGBoost model training skipped (VAL_XG = FALSE)"
+            )
+        }
+        
+        checkpoint_system <- save_checkpoint(xgb_data, "xgboost_model", checkpoint_system, step_start,
+                                           ifelse(VAL_XG,
+                                                 sprintf("XGBoost model trained with accuracy: %.3f",
+                                                        ifelse(exists("model_xgboost"), max(model_xgboost$results$Accuracy), 0)),
+                                                 "XGBoost training skipped"))
+
+        ##################################################################################
+        # GENERATE FINAL REPORTS AND SUMMARIES
+        ##################################################################################
+        
+        # Generate timing report
+        timing_report_file <- generate_timing_report(checkpoint_system, save_to_file = TRUE)
+        
+        # Generate reproduction script
+        reproduction_script_file <- generate_reproduction_script(checkpoint_system)
+        
+        # Save final comprehensive summary
+        additional_info <- list(
+            final_model_performances = list(
+                rf_accuracy = ifelse(VAL_RF && exists("model_rf"), max(model_rf$results$Accuracy), NA),
+                glmnet_accuracy = ifelse(VAL_GLMNET && exists("model_glmnet"), max(model_glmnet$results$Accuracy), NA),
+                xgb_accuracy = ifelse(VAL_XG && exists("model_xgboost"), max(model_xgboost$results$Accuracy), NA)
+            ),
+            final_feature_count = length(rel_features),
+            prediction_mode = PRED_MODE,
+            output_files = list(
+                timing_report = timing_report_file,
+                reproduction_script = reproduction_script_file
+            )
+        )
+        
+        final_summary <- save_final_summary(checkpoint_system, additional_info)
+        
+        # List all available checkpoints
+        cat("\n")
+        list_checkpoints(checkpoint_system$checkpoint_dir, checkpoint_system$out_label)
+        
+        cat("\n")
+        cat("="*60, "\n")
+        cat("PIPELINE COMPLETED FOR MODE:", PRED_MODE, "\n")
+        cat("="*60, "\n")
+        
+        return(TRUE)
+    })
+})
+
+end_time <- Sys.time()
+total_runtime <- end_time - start_time
+cat("Total pipeline runtime:", sprintf("%.2f minutes", as.numeric(difftime(end_time, start_time, units = "mins"))), "\n")
+####################################################################################################################################################################
+```
